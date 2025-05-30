@@ -1,13 +1,81 @@
 import asyncio
 import websockets
+import logging
+import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from concurrent.futures import ThreadPoolExecutor
 
-# Токен бота, полученный от @BotFather
-TOKEN = "7915084633:AAFYbQeFHdFlBIxavaHV94b39RtUkrA8PGQ"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# URL WebSocket-сервера
+# Токен бота из переменной окружения
+TOKEN = os.getenv("BOT_TOKEN")
+
+# URL WebSocket-сервера (на Render используем localhost внутри контейнера)
 WEBSOCKET_URL = "ws://localhost:8765"
+
+# Список подключенных WebSocket-клиентов
+connected_clients = set()
+
+async def handle_client(websocket):
+    """Обрабатывает подключение WebSocket-клиента."""
+    connected_clients.add(websocket)
+    logger.info(f"Клиент подключен: {websocket.remote_address}, всего клиентов: {len(connected_clients)}")
+    try:
+        async for message in websocket:
+            logger.info(f"Получено сообщение: {message}")
+            if len(connected_clients) > 1:
+                for client in connected_clients.copy():
+                    if client != websocket:
+                        try:
+                            await client.send(message)
+                            logger.info(f"Отправлено сообщение клиенту: {client.remote_address}")
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.info(f"Клиент {client.remote_address} уже отключен")
+                            connected_clients.discard(client)
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки клиенту {client.remote_address}: {e}")
+                    else:
+                        logger.info(f"Пропущен клиент: {client.remote_address} (тот же клиент)")
+            else:
+                logger.info("Нет других клиентов для пересылки сообщения")
+    except websockets.exceptions.ConnectionClosed:
+        logger.info(f"Клиент отключен: {websocket.remote_address}")
+    except Exception as e:
+        logger.error(f"Ошибка обработки клиента: {e}")
+    finally:
+        connected_clients.discard(websocket)
+        logger.info(f"Клиент удален, осталось клиентов: {len(connected_clients)}")
+
+async def start_websocket_server():
+    """Запускает WebSocket-сервер."""
+    try:
+        server = await websockets.serve(handle_client, "0.0.0.0", 8765)
+        logger.info("WebSocket-сервер запущен на ws://0.0.0.0:8765")
+        await server.wait_closed()
+    except Exception as e:
+        logger.error(f"Ошибка сервера: {e}")
+
+async def start_bot():
+    """Запускает Telegram-бота."""
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        logger.info("Остановка бота...")
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение с основными кнопками."""
@@ -18,7 +86,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    # Сохраняем сообщение с основными кнопками
     main_message = await update.message.reply_text("Виберіть опцію:", reply_markup=reply_markup)
     context.chat_data["main_message_id"] = main_message.message_id
 
@@ -26,7 +93,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
 
-    # Определяем действия для кнопок
     button_actions = {
         "fpv": {
             "message": "ФПВ обрано",
@@ -66,7 +132,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     action = button_actions.get(query.data)
     if action:
-        # Отправляем команду через WebSocket
         print(f"Отправка команды на WebSocket: {action['sound']}")
         try:
             async with websockets.connect(WEBSOCKET_URL) as websocket:
@@ -75,16 +140,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e:
             print(f"Ошибка WebSocket: {e}")
 
-        # Отправляем временное сообщение с действием
         temp_message = await query.message.reply_text(action["message"])
         asyncio.create_task(delete_message_after_delay(context, temp_message.chat_id, temp_message.message_id, 3))
 
-        # Обновляем или создаем сообщение с дополнительными кнопками
         if "sub_buttons" in action:
-            # Разбиваем кнопки на пары для компактного отображения
             keyboard = [action["sub_buttons"][i:i+2] for i in range(0, len(action["sub_buttons"]), 2)]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
             if "sub_message_id" in context.chat_data:
                 try:
                     await context.bot.edit_message_text(
@@ -100,9 +161,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 sub_message = await query.message.reply_text("Виберіть додаткову опцію:", reply_markup=reply_markup)
                 context.chat_data["sub_message_id"] = sub_message.message_id
-        else:
-            # Если выбрана дополнительная кнопка, не меняем дополнительные кнопки
-            pass
 
 async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int) -> None:
     """Удаляет сообщение после указанной задержки."""
@@ -113,39 +171,15 @@ async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id
     except Exception as e:
         print(f"Ошибка при удалении сообщения {message_id}: {e}")
 
-async def main() -> None:
-    """Запускает бота."""
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Запуск polling
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    
-    # Держим бота активным
-    try:
-        while True:
-            await asyncio.sleep(3600)  # Спим 1 час, чтобы не завершать цикл
-    except KeyboardInterrupt:
-        print("Остановка бота...")
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-
-def run_bot():
-    """Запускает бота в текущем событийном цикле."""
+async def main():
+    """Запускает бота и WebSocket-сервер."""
     loop = asyncio.get_event_loop()
-    if loop.is_running():
-        # Если цикл уже работает, создаем задачу
-        loop.create_task(main())
-    else:
-        # Если цикл не запущен, используем run_until_complete
-        loop.run_until_complete(main())
+    with ThreadPoolExecutor() as executor:
+        loop.run_in_executor(executor, lambda: asyncio.run(start_websocket_server()))
+        await start_bot()
 
 if __name__ == "__main__":
     try:
-        run_bot()
+        asyncio.run(main())
     except Exception as e:
-        print(f"Ошибка запуска бота: {e}")
+        logger.error(f"Ошибка запуска: {e}")
